@@ -37,8 +37,35 @@ env:
   APP_NAME: 'Immich Plus'
 
 jobs:
+  check-secrets:
+    name: Verifica configurazione
+    runs-on: ubuntu-latest
+    outputs:
+      configured: ${{ steps.check.outputs.configured }}
+    steps:
+      - name: 🔎 Verifica i secret
+        id: check
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          FIREBASE_APP_ID: ${{ secrets.FIREBASE_APP_ID }}
+          FIREBASE_CREDENTIALS_JSON: ${{ secrets.FIREBASE_CREDENTIALS_JSON }}
+        run: |
+          configured=true
+          for name in KEYSTORE_BASE64 KEY_ALIAS KEYSTORE_PASSWORD KEY_PASSWORD FIREBASE_APP_ID FIREBASE_CREDENTIALS_JSON; do
+            if [[ -z "${!name}" ]]; then
+              echo "::warning::Secret $name non configurato: distribuzione saltata"
+              configured=false
+            fi
+          done
+          echo "configured=$configured" >> "$GITHUB_OUTPUT"
+
   build-and-distribute:
     name: Build & Distribute Android APK
+    needs: check-secrets
+    if: needs.check-secrets.outputs.configured == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 120
 
@@ -54,24 +81,6 @@ jobs:
           ref: ${{ inputs.ref || github.ref }}
           fetch-depth: 50
           persist-credentials: false
-
-      - name: 🔎 Verifica i secret
-        env:
-          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
-          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
-          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
-          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
-          FIREBASE_APP_ID: ${{ secrets.FIREBASE_APP_ID }}
-          FIREBASE_CREDENTIALS_JSON: ${{ secrets.FIREBASE_CREDENTIALS_JSON }}
-        run: |
-          missing=0
-          for name in KEYSTORE_BASE64 KEY_ALIAS KEYSTORE_PASSWORD KEY_PASSWORD FIREBASE_APP_ID FIREBASE_CREDENTIALS_JSON; do
-            if [[ -z "${!name}" ]]; then
-              echo "::error::Secret $name non configurato"
-              missing=1
-            fi
-          done
-          exit $missing
 
       - name: 🏷️ Calcola la versione
         id: version
