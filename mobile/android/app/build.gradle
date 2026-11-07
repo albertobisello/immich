@@ -70,8 +70,12 @@ android {
       signingConfig hasKeystore ? signingConfigs.release : signingConfigs.debug
       proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
 
+      def appIdSuffix = System.getenv("APP_ID_SUFFIX")
       def prNumber = System.getenv("PR_NUMBER")
-      if (prNumber) {
+      if (appIdSuffix) {
+        applicationIdSuffix appIdSuffix
+        resValue "string", "app_name", System.getenv("APP_NAME") ?: "Immich"
+      } else if (prNumber) {
         applicationIdSuffix ".pr${prNumber}"
         versionNameSuffix "-pr${prNumber}"
         resValue "string", "app_name", "Immich PR ${prNumber}"

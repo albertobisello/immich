@@ -1,0 +1,185 @@
+name: Distribuzione App Android (Firebase App Distribution)
+
+# Compila l'app Flutter (mobile/) come "Immich Plus" (applicationId app.alextran.immich.plus,
+# installabile accanto all'Immich ufficiale), la firma con il keystore del fork e la
+# distribuisce su Firebase App Distribution.
+# - push su main che tocca l'app: rilascio automatico
+# - workflow_dispatch: rilascio manuale di qualsiasi branch, tag o PR (es. refs/pull/1/head)
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'mobile/**'
+      - 'open-api/**'
+      - 'i18n/**'
+      - 'native/**'
+      - '.github/workflows/mobile-firebase-distribution.yml'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch, tag, SHA o PR da compilare (es. refs/pull/1/head). Vuoto = branch selezionato'
+        required: false
+        type: string
+      release_notes:
+        description: 'Note di rilascio (opzionali, sostituiscono quelle automatiche)'
+        required: false
+        type: string
+
+concurrency:
+  group: mobile-firebase-distribution
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  APP_ID_SUFFIX: '.plus'
+  APP_NAME: 'Immich Plus'
+
+jobs:
+  build-and-distribute:
+    name: Build & Distribute Android APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: 🧹 Libera spazio sul runner
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: 📥 Checkout del codice
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 50
+          persist-credentials: false
+
+      - name: 🔎 Verifica i secret
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          FIREBASE_APP_ID: ${{ secrets.FIREBASE_APP_ID }}
+          FIREBASE_CREDENTIALS_JSON: ${{ secrets.FIREBASE_CREDENTIALS_JSON }}
+        run: |
+          missing=0
+          for name in KEYSTORE_BASE64 KEY_ALIAS KEYSTORE_PASSWORD KEY_PASSWORD FIREBASE_APP_ID FIREBASE_CREDENTIALS_JSON; do
+            if [[ -z "${!name}" ]]; then
+              echo "::error::Secret $name non configurato"
+              missing=1
+            fi
+          done
+          exit $missing
+
+      - name: 🏷️ Calcola la versione
+        id: version
+        run: |
+          BASE=$(sed -n 's/^version:[[:space:]]*\([^+]*\).*/\1/p' mobile/pubspec.yaml | head -1)
+          if [[ -z "$BASE" ]]; then
+            echo "::error::version non trovata in mobile/pubspec.yaml"
+            exit 1
+          fi
+          echo "name=${BASE}-plus.${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+          echo "code=${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+          echo "Versione: ${BASE}-plus.${GITHUB_RUN_NUMBER} (versionCode ${GITHUB_RUN_NUMBER})"
+
+      - name: 📝 Prepara il changelog
+        env:
+          VERSION_NAME: ${{ steps.version.outputs.name }}
+          INPUT_NOTES: ${{ inputs.release_notes }}
+          SOURCE_REF: ${{ inputs.ref || github.ref_name }}
+        run: |
+          {
+            echo "Immich Plus $VERSION_NAME"
+            echo "Sorgente: $SOURCE_REF ($(git rev-parse --short HEAD))"
+            echo ""
+            if [[ -n "$INPUT_NOTES" ]]; then
+              echo "$INPUT_NOTES"
+            elif [[ -f mobile/release-notes-plus.txt ]]; then
+              cat mobile/release-notes-plus.txt
+            else
+              echo "Ultime modifiche:"
+              git log -n 10 --no-merges --format='- %s' -- mobile native
+            fi
+          } > changelog.txt
+          cat changelog.txt
+
+      - name: 🔐 Ripristina il keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: printf "%s" "$KEYSTORE_BASE64" | base64 -d > mobile/android/key.jks
+
+      - name: 🦀 Ripristina cache Rust
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.rustup/toolchains
+            ~/.rustup/update-hashes
+            ~/.cargo/bin
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: firebase-mobile-rust-${{ runner.os }}-${{ hashFiles('native/crates/native_core_ffi/rust-toolchain.toml', 'native/Cargo.lock') }}
+          restore-keys: |
+            firebase-mobile-rust-${{ runner.os }}-
+
+      - name: 🐘 Ripristina cache Gradle
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: firebase-mobile-gradle-${{ runner.os }}-${{ hashFiles('mobile/android/**/*.gradle', 'mobile/android/gradle/**') }}
+          restore-keys: |
+            firebase-mobile-gradle-${{ runner.os }}-
+
+      - name: 🧰 Setup Mise (Flutter, Java, Rust)
+        uses: immich-app/devtools/actions/use-mise@caac7f7e4298458a14238959504f411fc6cc7f06 # use-mise-action-v3.2.3
+        with:
+          github_token: ${{ github.token }}
+          working_directory: ./mobile
+
+      - name: 🤖 Setup Android SDK
+        uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
+        with:
+          packages: ''
+
+      - name: 📦 Installa le dipendenze
+        run: mise //mobile:install:ci
+
+      - name: ⚙️ Codegen
+        run: mise //mobile:codegen
+
+      - name: 🔨 Build APK Release firmato
+        working-directory: ./mobile
+        env:
+          ALIAS: ${{ secrets.KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          ANDROID_STORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          VERSION_NAME: ${{ steps.version.outputs.name }}
+          VERSION_CODE: ${{ steps.version.outputs.code }}
+        run: |
+          mise exec -- flutter build apk --release --build-name "$VERSION_NAME" --build-number "$VERSION_CODE"
+          ls -la build/app/outputs/flutter-apk/
+
+      - name: 🚀 Carica su Firebase App Distribution
+        uses: wzieba/Firebase-Distribution-Github-Action@50fbc622fc4ef5163becd7fab6573eac35f8462e # v1
+        with:
+          appId: ${{ secrets.FIREBASE_APP_ID }}
+          serviceCredentialsFileContent: ${{ secrets.FIREBASE_CREDENTIALS_JSON }}
+          groups: ${{ vars.FIREBASE_TESTER_GROUPS || 'team-tester' }}
+          file: mobile/build/app/outputs/flutter-apk/app-release.apk
+          releaseNotesFile: changelog.txt
+
+      - name: 📤 Salva l'APK come artifact
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: immich-plus-${{ steps.version.outputs.name }}
+          path: mobile/build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: ignore
+
+      - name: 🧽 Rimuovi il keystore
+        if: always()
+        run: rm -f mobile/android/key.jks
