@@ -2,7 +2,7 @@ import 'package:freezed_annotation/freezed_annotation.dart';
 
 part 'cast_manager_state.freezed.dart';
 
-enum CastDestinationType { googleCast }
+enum CastDestinationType { googleCast, dlna }
 
 enum CastState { idle, playing, paused, buffering }
 
