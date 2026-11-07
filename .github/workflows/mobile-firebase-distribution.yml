@@ -34,7 +34,7 @@ permissions:
 
 env:
   APP_ID_SUFFIX: '.plus'
-  APP_NAME: 'Immich Plus'
+  IMMICH_APP_NAME: 'Immich Plus'
 
 jobs:
   check-secrets:
