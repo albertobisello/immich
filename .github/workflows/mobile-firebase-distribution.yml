@@ -164,7 +164,7 @@ jobs:
           ls -la build/app/outputs/flutter-apk/
 
       - name: 🚀 Carica su Firebase App Distribution
-        uses: wzieba/Firebase-Distribution-Github-Action@50fbc622fc4ef5163becd7fab6573eac35f8462e # v1
+        uses: wzieba/Firebase-Distribution-Github-Action@bd494989dd4bec0343f78adee87fe66e48279ad6 # v1.7.1
         with:
           appId: ${{ secrets.FIREBASE_APP_ID }}
           serviceCredentialsFileContent: ${{ secrets.FIREBASE_CREDENTIALS_JSON }}
