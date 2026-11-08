@@ -325,19 +325,6 @@ class DlnaRepository {
     return result;
   }
 
-  /// Makes a HEAD request to detect the content type the server will return for [url]
-  Future<String?> getContentType(String url) async {
-    try {
-      final response = await _client.head(Uri.parse(url)).timeout(_requestTimeout);
-      if (response.statusCode >= 400) {
-        return null;
-      }
-      return response.headers['content-type']?.split(';').first.trim();
-    } catch (_) {
-      return null;
-    }
-  }
-
   static String _escape(String value) => value
       .replaceAll('&', '&amp;')
       .replaceAll('<', '&lt;')
