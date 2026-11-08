@@ -8,10 +8,7 @@ import 'package:immich_mobile/services/dlna.service.dart';
 import 'package:immich_mobile/services/gcast.service.dart';
 
 final castProvider = StateNotifierProvider<CastNotifier, CastManagerState>(
-  (ref) => CastNotifier(
-    ref.watch(gCastServiceProvider),
-    ref.watch(dlnaServiceProvider),
-  ),
+  (ref) => CastNotifier(ref.watch(gCastServiceProvider), ref.watch(dlnaServiceProvider)),
 );
 
 class CastNotifier extends StateNotifier<CastManagerState> {
@@ -34,48 +31,21 @@ class CastNotifier extends StateNotifier<CastManagerState> {
           castState: CastState.idle,
         ),
       ) {
-    _gCastService.onConnectionState = _guard(
-      CastDestinationType.googleCast,
-      _onConnectionState,
-    );
-    _gCastService.onCurrentTime = _guard(
-      CastDestinationType.googleCast,
-      _onCurrentTime,
-    );
-    _gCastService.onDuration = _guard(
-      CastDestinationType.googleCast,
-      _onDuration,
-    );
-    _gCastService.onReceiverName = _guard(
-      CastDestinationType.googleCast,
-      _onReceiverName,
-    );
-    _gCastService.onCastState = _guard(
-      CastDestinationType.googleCast,
-      _onCastState,
-    );
+    _gCastService.onConnectionState = _guard(CastDestinationType.googleCast, _onConnectionState);
+    _gCastService.onCurrentTime = _guard(CastDestinationType.googleCast, _onCurrentTime);
+    _gCastService.onDuration = _guard(CastDestinationType.googleCast, _onDuration);
+    _gCastService.onReceiverName = _guard(CastDestinationType.googleCast, _onReceiverName);
+    _gCastService.onCastState = _guard(CastDestinationType.googleCast, _onCastState);
 
-    _dlnaService.onConnectionState = _guard(
-      CastDestinationType.dlna,
-      _onConnectionState,
-    );
-    _dlnaService.onCurrentTime = _guard(
-      CastDestinationType.dlna,
-      _onCurrentTime,
-    );
+    _dlnaService.onConnectionState = _guard(CastDestinationType.dlna, _onConnectionState);
+    _dlnaService.onCurrentTime = _guard(CastDestinationType.dlna, _onCurrentTime);
     _dlnaService.onDuration = _guard(CastDestinationType.dlna, _onDuration);
-    _dlnaService.onReceiverName = _guard(
-      CastDestinationType.dlna,
-      _onReceiverName,
-    );
+    _dlnaService.onReceiverName = _guard(CastDestinationType.dlna, _onReceiverName);
     _dlnaService.onCastState = _guard(CastDestinationType.dlna, _onCastState);
   }
 
   /// Only forwards updates coming from the receiver type currently in use
-  void Function(T) _guard<T>(
-    CastDestinationType type,
-    void Function(T) callback,
-  ) {
+  void Function(T) _guard<T>(CastDestinationType type, void Function(T) callback) {
     return (value) {
       if (_activeType == type && mounted) {
         callback(value);
@@ -125,17 +95,29 @@ class CastNotifier extends StateNotifier<CastManagerState> {
   Future<List<(String, CastDestinationType, dynamic)>> getDevices() async {
     if (discovered.isEmpty) {
       final results = await Future.wait([
-        _gCastService.getDevices().catchError(
-          (_) => <(String, CastDestinationType, dynamic)>[],
-        ),
-        _dlnaService.getDevices().catchError(
-          (_) => <(String, CastDestinationType, dynamic)>[],
-        ),
+        _gCastService.getDevices().catchError((_) => <(String, CastDestinationType, dynamic)>[]),
+        _dlnaService.getDevices().catchError((_) => <(String, CastDestinationType, dynamic)>[]),
       ]);
       discovered = results.expand((devices) => devices).toList(growable: false);
     }
 
     return discovered;
+  }
+
+  /// Forgets the cached devices so that the next [getDevices] searches the network again
+  void clearDiscovered() {
+    discovered = List.empty();
+  }
+
+  /// Looks for a DLNA TV at a user-entered address. Returns false if nothing answered there.
+  Future<bool> addManualDevice(String host) async {
+    final found = await _dlnaService.addManualDevice(host);
+    if (found.isEmpty) {
+      return false;
+    }
+    final names = discovered.map((d) => d.$1).toSet();
+    discovered = [...discovered, ...found.where((d) => !names.contains(d.$1))];
+    return true;
   }
 
   void toggle() {
