@@ -6,7 +6,6 @@ import 'package:immich_mobile/extensions/build_context_extensions.dart';
 import 'package:immich_mobile/generated/translations.g.dart';
 import 'package:immich_mobile/models/cast/cast_manager_state.dart';
 import 'package:immich_mobile/providers/cast.provider.dart';
-import 'package:immich_mobile/services/dlna.service.dart';
 
 class CastDialog extends ConsumerStatefulWidget {
   const CastDialog({super.key});
@@ -98,23 +97,8 @@ class _CastDialogState extends ConsumerState<CastDialog> {
               return const SizedBox(height: 48, child: Center(child: CircularProgressIndicator()));
             }
 
-            final vpnWarning = DlnaService.isCastEndpointVpnOnly()
-                ? Padding(
-                    padding: const EdgeInsets.only(top: 12.0),
-                    child: Text(
-                      context.t.cast_server_vpn_warning,
-                      style: context.textTheme.bodySmall?.copyWith(color: context.colorScheme.error),
-                    ),
-                  )
-                : null;
-
             if (snapshot.data!.isEmpty) {
-              return SingleChildScrollView(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [Text(context.t.no_cast_devices_found), ?vpnWarning],
-                ),
-              );
+              return Text(context.t.no_cast_devices_found);
             }
 
             final devices = snapshot.data!;
@@ -133,19 +117,13 @@ class _CastDialogState extends ConsumerState<CastDialog> {
               sectionedList.addAll(others);
             }
 
-            if (vpnWarning != null) {
-              sectionedList.add(vpnWarning);
-            }
-
             return ListView.builder(
               shrinkWrap: true,
               itemCount: sectionedList.length,
               itemBuilder: (context, index) {
                 final item = sectionedList[index];
 
-                if (item is Widget) {
-                  return item;
-                } else if (item is String) {
+                if (item is String) {
                   // It's a section header
                   return Padding(
                     padding: const EdgeInsets.symmetric(vertical: 8.0),

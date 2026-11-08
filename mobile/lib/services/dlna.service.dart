@@ -4,14 +4,13 @@ import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:immich_mobile/domain/models/asset/base_asset.model.dart';
 import 'package:immich_mobile/domain/models/store.model.dart';
 import 'package:immich_mobile/entities/store.entity.dart';
-import 'package:immich_mobile/infrastructure/repositories/settings.repository.dart';
 import 'package:immich_mobile/models/cast/cast_manager_state.dart';
 import 'package:immich_mobile/models/sessions/session_create_response.model.dart';
 import 'package:immich_mobile/repositories/asset_api.repository.dart';
 import 'package:immich_mobile/repositories/dlna.repository.dart';
+import 'package:immich_mobile/repositories/dlna_proxy.repository.dart';
 import 'package:immich_mobile/repositories/sessions_api.repository.dart';
 import 'package:immich_mobile/utils/image_url_builder.dart';
-import 'package:immich_mobile/utils/url_helper.dart';
 import 'package:logging/logging.dart';
 // ignore: import_rule_openapi, we are only using the AssetMediaSize enum
 import 'package:openapi/api.dart';
@@ -19,6 +18,7 @@ import 'package:openapi/api.dart';
 final dlnaServiceProvider = Provider(
   (ref) => DlnaService(
     ref.watch(dlnaRepositoryProvider),
+    ref.watch(dlnaProxyRepositoryProvider),
     ref.watch(sessionsAPIRepositoryProvider),
     ref.watch(assetApiRepositoryProvider),
   ),
@@ -26,10 +26,11 @@ final dlnaServiceProvider = Provider(
 
 /// Casts photos and videos to UPnP/DLNA media renderers, such as LG webOS TVs.
 ///
-/// The TV downloads the media directly from the Immich server, so the server
-/// URL configured in the app must be reachable from the TV.
+/// The TV downloads the media from a small relay on the phone ([DlnaProxyRepository]),
+/// so it works even when the server is only reachable through the phone's VPN.
 class DlnaService {
   final DlnaRepository _dlnaRepository;
+  final DlnaProxyRepository _dlnaProxyRepository;
   final SessionsAPIRepository _sessionsApiService;
   final AssetApiRepository _assetApiRepository;
 
@@ -49,7 +50,7 @@ class DlnaService {
   void Function(String)? onReceiverName;
   void Function(CastState)? onCastState;
 
-  DlnaService(this._dlnaRepository, this._sessionsApiService, this._assetApiRepository);
+  DlnaService(this._dlnaRepository, this._dlnaProxyRepository, this._sessionsApiService, this._assetApiRepository);
 
   bool get isConnected => _device != null;
 
@@ -85,30 +86,6 @@ class DlnaService {
     return matching.map(_toDestination).toList(growable: false);
   }
 
-  /// The API endpoint the TV should download media from.
-  ///
-  /// The TV can't use the phone's VPN (e.g. Tailscale), so prefer the local network URL
-  /// configured in the networking settings, if any.
-  static String castEndpoint() {
-    final serverEndpoint = Store.get(StoreKey.serverEndpoint);
-    final localEndpoint = SettingsRepository.instance.appConfig.network.localEndpoint?.trim();
-    if (localEndpoint == null || localEndpoint.isEmpty) {
-      return serverEndpoint;
-    }
-    final normalized = normalizeServerUrl(localEndpoint);
-    return normalized.endsWith('/api') ? normalized : '$normalized/api';
-  }
-
-  /// Whether the server URL the TV would use is only reachable through a VPN like Tailscale
-  static bool isCastEndpointVpnOnly() {
-    final host = Uri.tryParse(castEndpoint())?.host.toLowerCase() ?? '';
-    if (host.endsWith('.ts.net') || host.endsWith('.tailscale.net')) {
-      return true;
-    }
-    final parts = host.split('.').map(int.tryParse).toList();
-    return parts.length == 4 && parts[0] == 100 && parts[1] != null && parts[1]! >= 64 && parts[1]! < 128;
-  }
-
   Future<void> connect(DlnaDevice device) async {
     // DLNA has no session: the renderer is "connected" as soon as it is selected
     onReceiverName?.call(device.name);
@@ -132,6 +109,7 @@ class DlnaService {
         _log.fine('Failed to stop DLNA renderer on disconnect', error);
       }
     }
+    await _dlnaProxyRepository.stop();
   }
 
   bool _isSessionValid() {
@@ -169,22 +147,21 @@ class DlnaService {
         );
       }
 
-      final unauthenticatedUrl = asset.isVideo
-          ? getPlaybackUrlForRemoteId(asset.id)
-          : getThumbnailUrlForRemoteId(asset.id, type: AssetMediaSize.fullsize);
-      final serverEndpoint = Store.get(StoreKey.serverEndpoint);
-      final endpoint = castEndpoint();
-      final url = "${endpoint + unauthenticatedUrl.substring(serverEndpoint.length)}&sessionKey=${_sessionKey?.token}";
-      if (isCastEndpointVpnOnly()) {
-        _log.warning('The TV probably can not reach $endpoint: set a local network URL in the networking settings');
-      }
-
-      final mimeType = await _resolveMimeType(asset, url);
+      final media = await _resolveMedia(asset);
       if (generation != _loadGeneration || _device != device) {
         return;
       }
 
-      final metadata = _buildDidlMetadata(asset, url, mimeType);
+      final dlnaFeatures = asset.isVideo ? _videoFeatures : _imageFeatures;
+      final url = await _dlnaProxyRepository.publish(
+        upstream: Uri.parse(media.url),
+        mimeType: media.mimeType,
+        dlnaFeatures: dlnaFeatures,
+        isVideo: asset.isVideo,
+        rendererHost: device.location.host,
+      );
+      _log.info('Casting ${asset.id} (${media.mimeType}) to ${device.name} via $url');
+      final metadata = _buildDidlMetadata(asset, url, media.mimeType, dlnaFeatures);
 
       try {
         await _dlnaRepository.sendAction(device, 'SetAVTransportURI', {
@@ -215,27 +192,40 @@ class DlnaService {
     }
   }
 
-  Future<String> _resolveMimeType(RemoteAsset asset, String url) async {
-    final fromServer = await _dlnaRepository.getContentType(url);
-    if (fromServer != null && (fromServer.startsWith('image/') || fromServer.startsWith('video/'))) {
-      return fromServer;
+  static const _videoFeatures = 'DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000';
+  static const _imageFeatures = 'DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=00D00000000000000000000000000000';
+  static const _tvImageTypes = {'image/jpeg', 'image/png'};
+
+  String _authenticated(String url) => "$url&sessionKey=${_sessionKey?.token}";
+
+  /// Picks the media URL and its real content type.
+  ///
+  /// For photos the full size endpoint redirects to the original when the browser can display it,
+  /// which may be a format the TV doesn't support (WebP, AVIF, GIF...): fall back to the JPEG preview.
+  Future<({String url, String mimeType})> _resolveMedia(RemoteAsset asset) async {
+    if (asset.isVideo) {
+      final url = _authenticated(getPlaybackUrlForRemoteId(asset.id));
+      final probed = await _dlnaProxyRepository.probeContentType(Uri.parse(url));
+      final mimeType = probed != null && probed.startsWith('video/')
+          ? probed
+          : await _assetApiRepository.getAssetMIMEType(asset.id) ?? 'video/mp4';
+      return (url: url, mimeType: mimeType);
     }
 
-    if (!asset.isVideo) {
-      // full size previews are generated as JPEG by default
-      return 'image/jpeg';
+    final fullsize = _authenticated(getThumbnailUrlForRemoteId(asset.id, type: AssetMediaSize.fullsize));
+    final fullsizeType = await _dlnaProxyRepository.probeContentType(Uri.parse(fullsize));
+    if (fullsizeType != null && _tvImageTypes.contains(fullsizeType)) {
+      return (url: fullsize, mimeType: fullsizeType);
     }
 
-    return await _assetApiRepository.getAssetMIMEType(asset.id) ?? 'video/mp4';
+    _log.info('Full size image of ${asset.id} is $fullsizeType, casting the preview instead');
+    final preview = _authenticated(getThumbnailUrlForRemoteId(asset.id, type: AssetMediaSize.preview));
+    final previewType = await _dlnaProxyRepository.probeContentType(Uri.parse(preview));
+    return (url: preview, mimeType: previewType ?? 'image/jpeg');
   }
 
-  String _buildDidlMetadata(RemoteAsset asset, String url, String mimeType) {
+  String _buildDidlMetadata(RemoteAsset asset, String url, String mimeType, String dlnaFeatures) {
     final upnpClass = asset.isVideo ? 'object.item.videoItem' : 'object.item.imageItem.photo';
-    final dlnaFeatures = asset.isVideo
-        ? 'DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000'
-        : (mimeType == 'image/jpeg'
-              ? 'DLNA.ORG_PN=JPEG_LRG;DLNA.ORG_OP=00;DLNA.ORG_CI=1;DLNA.ORG_FLAGS=00900000000000000000000000000000'
-              : '*');
     final duration = asset.isVideo && asset.duration > Duration.zero
         ? ' duration="${_formatTime(asset.duration)}.000"'
         : '';
