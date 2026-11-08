@@ -50,63 +50,171 @@ class DlnaRepository {
   final _log = Logger('DlnaRepository');
   final http.Client _client = http.Client();
 
+  /// Discovers media renderers on the local network.
+  ///
+  /// [extraHosts] are addresses entered by the user: they are queried with a unicast M-SEARCH,
+  /// which also works when multicast doesn't (mesh repeaters, VPNs, routed subnets). An entry
+  /// can also be the full URL of the device description (`http://...`).
   Future<List<DlnaDevice>> listDestinations({
     Duration timeout = const Duration(seconds: 3),
+    Iterable<String> extraHosts = const [],
   }) async {
     final locations = <String>{};
+    final sockets = <RawDatagramSocket>[];
 
-    RawDatagramSocket? socket;
+    for (final host in extraHosts) {
+      if (host.startsWith('http://') || host.startsWith('https://')) {
+        locations.add(host);
+      }
+    }
+
     try {
-      socket = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
-      socket.multicastHops = 4;
+      // A socket per Wi-Fi/Ethernet interface: with a VPN (e.g. Tailscale) active, the default
+      // multicast route can point to the VPN tunnel, where SSDP packets are silently dropped.
+      final interfaces = await _lanInterfaces();
+      for (final address in interfaces) {
+        final socket = await _openSocket(address, locations);
+        if (socket != null) {
+          sockets.add(socket);
+        }
+      }
+      // Fallback socket using the system's default route
+      final defaultSocket = await _openSocket(null, locations);
+      if (defaultSocket != null) {
+        sockets.add(defaultSocket);
+      }
 
-      final subscription = socket.listen((event) {
-        if (event != RawSocketEvent.read) {
-          return;
+      final unicastTargets = <InternetAddress>[];
+      for (final host in extraHosts) {
+        if (host.startsWith('http://') || host.startsWith('https://')) {
+          continue;
         }
-        final datagram = socket?.receive();
-        if (datagram == null) {
-          return;
+        final address =
+            InternetAddress.tryParse(host) ??
+            (await InternetAddress.lookup(host).catchError((_) => <InternetAddress>[])).firstOrNull;
+        if (address != null && address.type == InternetAddressType.IPv4) {
+          unicastTargets.add(address);
         }
-        final location = _parseLocation(
-          utf8.decode(datagram.data, allowMalformed: true),
-        );
-        if (location != null) {
-          locations.add(location);
-        }
-      });
+      }
 
-      final destination = InternetAddress(_ssdpAddress);
-      // UDP is unreliable, send each search a couple of times
-      for (var i = 0; i < 2; i++) {
+      final multicast = InternetAddress(_ssdpAddress);
+      // UDP is unreliable, send each search a few times
+      for (var i = 0; i < 3; i++) {
         for (final st in _searchTargets) {
-          final message =
-              'M-SEARCH * HTTP/1.1\r\n'
-              'HOST: $_ssdpAddress:$_ssdpPort\r\n'
-              'MAN: "ssdp:discover"\r\n'
-              'MX: 2\r\n'
-              'ST: $st\r\n'
-              'USER-AGENT: Android UPnP/1.1 Immich/1.0\r\n'
-              '\r\n';
-          socket.send(utf8.encode(message), destination, _ssdpPort);
+          for (final socket in sockets) {
+            _send(socket, multicast, '$_ssdpAddress:$_ssdpPort', st);
+          }
+          for (final target in sockets.isEmpty ? const <InternetAddress>[] : unicastTargets) {
+            _send(sockets.last, target, '${target.address}:$_ssdpPort', st);
+          }
         }
         await Future.delayed(const Duration(milliseconds: 300));
       }
 
       await Future.delayed(timeout);
-      await subscription.cancel();
     } catch (error, stackTrace) {
       _log.warning('SSDP discovery failed', error, stackTrace);
     } finally {
-      socket?.close();
+      for (final socket in sockets) {
+        socket.close();
+      }
     }
+
+    _log.info('SSDP discovery found ${locations.length} UPnP device description(s)');
 
     final devices = await Future.wait(locations.map(_fetchDevice));
     final byUdn = <String, DlnaDevice>{};
     for (final device in devices.whereType<DlnaDevice>()) {
       byUdn.putIfAbsent(device.udn, () => device);
     }
+    _log.info('Found ${byUdn.length} DLNA media renderer(s): ${byUdn.values.map((d) => d.name).join(', ')}');
     return byUdn.values.toList(growable: false);
+  }
+
+  /// IPv4 addresses of the local network interfaces, skipping VPN tunnels
+  Future<List<InternetAddress>> _lanInterfaces() async {
+    try {
+      final interfaces = await NetworkInterface.list(type: InternetAddressType.IPv4, includeLoopback: false);
+      final result = <InternetAddress>[];
+      for (final interface in interfaces) {
+        final name = interface.name.toLowerCase();
+        if (_vpnInterfacePrefixes.any(name.startsWith)) {
+          continue;
+        }
+        for (final address in interface.addresses) {
+          if (!address.isLoopback && !address.isLinkLocal && !_isCgnat(address)) {
+            result.add(address);
+          }
+        }
+      }
+      _log.fine('SSDP interfaces: ${result.map((a) => a.address).join(', ')}');
+      return result;
+    } catch (error) {
+      _log.fine('Failed to list network interfaces', error);
+      return const [];
+    }
+  }
+
+  static const _vpnInterfacePrefixes = ['tun', 'tap', 'ppp', 'wg', 'tailscale', 'utun', 'ipsec', 'rmnet', 'ccmni'];
+
+  /// Tailscale uses 100.64.0.0/10
+  static bool _isCgnat(InternetAddress address) {
+    final bytes = address.rawAddress;
+    return bytes.length == 4 && bytes[0] == 100 && (bytes[1] & 0xC0) == 64;
+  }
+
+  Future<RawDatagramSocket?> _openSocket(InternetAddress? interfaceAddress, Set<String> locations) async {
+    try {
+      final socket = await RawDatagramSocket.bind(interfaceAddress ?? InternetAddress.anyIPv4, 0);
+      socket.multicastHops = 4;
+      if (interfaceAddress != null) {
+        try {
+          socket.setRawOption(
+            RawSocketOption(
+              RawSocketOption.levelIPv4,
+              RawSocketOption.IPv4MulticastInterface,
+              interfaceAddress.rawAddress,
+            ),
+          );
+        } catch (error) {
+          _log.fine('Failed to set multicast interface ${interfaceAddress.address}', error);
+        }
+      }
+
+      socket.listen((event) {
+        if (event != RawSocketEvent.read) {
+          return;
+        }
+        final datagram = socket.receive();
+        if (datagram == null) {
+          return;
+        }
+        final location = _parseLocation(utf8.decode(datagram.data, allowMalformed: true));
+        if (location != null) {
+          locations.add(location);
+        }
+      });
+      return socket;
+    } catch (error) {
+      _log.fine('Failed to open SSDP socket on ${interfaceAddress?.address ?? 'default route'}', error);
+      return null;
+    }
+  }
+
+  void _send(RawDatagramSocket socket, InternetAddress destination, String host, String st) {
+    final message =
+        'M-SEARCH * HTTP/1.1\r\n'
+        'HOST: $host\r\n'
+        'MAN: "ssdp:discover"\r\n'
+        'MX: 2\r\n'
+        'ST: $st\r\n'
+        'USER-AGENT: Android UPnP/1.1 Immich/1.0\r\n'
+        '\r\n';
+    try {
+      socket.send(utf8.encode(message), destination, _ssdpPort);
+    } catch (error) {
+      _log.fine('Failed to send M-SEARCH to ${destination.address}', error);
+    }
   }
 
   String? _parseLocation(String response) {
@@ -131,27 +239,16 @@ class DlnaRepository {
         return null;
       }
 
-      final document = XmlDocument.parse(
-        utf8.decode(response.bodyBytes, allowMalformed: true),
-      );
+      final document = XmlDocument.parse(utf8.decode(response.bodyBytes, allowMalformed: true));
       final urlBase = _firstText(document, 'URLBase');
-      final baseUri = urlBase != null && urlBase.isNotEmpty
-          ? Uri.parse(urlBase)
-          : location;
+      final baseUri = urlBase != null && urlBase.isNotEmpty ? Uri.parse(urlBase) : location;
 
-      for (final device in document.findAllElements(
-        'device',
-        namespaceUri: '*',
-      )) {
+      for (final device in document.findAllElements('device', namespaceUri: '*')) {
         final deviceType = _childText(device, 'deviceType') ?? '';
         final service = device
             .findElements('serviceList', namespaceUri: '*')
             .expand((list) => list.findElements('service', namespaceUri: '*'))
-            .where(
-              (s) => (_childText(s, 'serviceType') ?? '').contains(
-                ':service:AVTransport:',
-              ),
-            )
+            .where((s) => (_childText(s, 'serviceType') ?? '').contains(':service:AVTransport:'))
             .firstOrNull;
 
         if (service == null || !deviceType.contains('MediaRenderer')) {
@@ -172,20 +269,13 @@ class DlnaRepository {
         );
       }
     } catch (error, stackTrace) {
-      _log.fine(
-        'Failed to read UPnP device description at $locationString',
-        error,
-        stackTrace,
-      );
+      _log.fine('Failed to read UPnP device description at $locationString', error, stackTrace);
     }
     return null;
   }
 
-  String? _firstText(XmlNode node, String name) => node
-      .findAllElements(name, namespaceUri: '*')
-      .firstOrNull
-      ?.innerText
-      .trim();
+  String? _firstText(XmlNode node, String name) =>
+      node.findAllElements(name, namespaceUri: '*').firstOrNull?.innerText.trim();
 
   String? _childText(XmlElement node, String name) =>
       node.findElements(name, namespaceUri: '*').firstOrNull?.innerText.trim();
@@ -212,10 +302,7 @@ class DlnaRepository {
     final response = await _client
         .post(
           device.avTransportControlUrl,
-          headers: {
-            'Content-Type': 'text/xml; charset="utf-8"',
-            'SOAPACTION': '"$serviceType#$action"',
-          },
+          headers: {'Content-Type': 'text/xml; charset="utf-8"', 'SOAPACTION': '"$serviceType#$action"'},
           body: utf8.encode(body),
         )
         .timeout(_requestTimeout);
@@ -228,11 +315,8 @@ class DlnaRepository {
     final result = <String, String>{};
     try {
       final document = XmlDocument.parse(responseBody);
-      final actionResponse = document
-          .findAllElements('${action}Response', namespaceUri: '*')
-          .firstOrNull;
-      for (final element
-          in actionResponse?.childElements ?? const <XmlElement>[]) {
+      final actionResponse = document.findAllElements('${action}Response', namespaceUri: '*').firstOrNull;
+      for (final element in actionResponse?.childElements ?? const <XmlElement>[]) {
         result[element.localName] = element.innerText;
       }
     } catch (_) {
@@ -244,9 +328,7 @@ class DlnaRepository {
   /// Makes a HEAD request to detect the content type the server will return for [url]
   Future<String?> getContentType(String url) async {
     try {
-      final response = await _client
-          .head(Uri.parse(url))
-          .timeout(_requestTimeout);
+      final response = await _client.head(Uri.parse(url)).timeout(_requestTimeout);
       if (response.statusCode >= 400) {
         return null;
       }

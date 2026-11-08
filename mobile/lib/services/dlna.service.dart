@@ -2,12 +2,16 @@ import 'dart:async';
 
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:immich_mobile/domain/models/asset/base_asset.model.dart';
+import 'package:immich_mobile/domain/models/store.model.dart';
+import 'package:immich_mobile/entities/store.entity.dart';
+import 'package:immich_mobile/infrastructure/repositories/settings.repository.dart';
 import 'package:immich_mobile/models/cast/cast_manager_state.dart';
 import 'package:immich_mobile/models/sessions/session_create_response.model.dart';
 import 'package:immich_mobile/repositories/asset_api.repository.dart';
 import 'package:immich_mobile/repositories/dlna.repository.dart';
 import 'package:immich_mobile/repositories/sessions_api.repository.dart';
 import 'package:immich_mobile/utils/image_url_builder.dart';
+import 'package:immich_mobile/utils/url_helper.dart';
 import 'package:logging/logging.dart';
 // ignore: import_rule_openapi, we are only using the AssetMediaSize enum
 import 'package:openapi/api.dart';
@@ -45,22 +49,64 @@ class DlnaService {
   void Function(String)? onReceiverName;
   void Function(CastState)? onCastState;
 
-  DlnaService(
-    this._dlnaRepository,
-    this._sessionsApiService,
-    this._assetApiRepository,
-  );
+  DlnaService(this._dlnaRepository, this._sessionsApiService, this._assetApiRepository);
 
   bool get isConnected => _device != null;
 
   Future<List<(String, CastDestinationType, dynamic)>> getDevices() async {
-    final devices = await _dlnaRepository.listDestinations();
-    return devices
-        .map(
-          (device) =>
-              (device.name, CastDestinationType.dlna, device as dynamic),
-        )
-        .toList(growable: false);
+    final devices = await _dlnaRepository.listDestinations(extraHosts: manualHosts);
+    return devices.map(_toDestination).toList(growable: false);
+  }
+
+  (String, CastDestinationType, dynamic) _toDestination(DlnaDevice device) =>
+      (device.name, CastDestinationType.dlna, device);
+
+  /// Addresses of TVs added by hand, for networks where multicast discovery doesn't work
+  List<String> get manualHosts =>
+      (Store.tryGet(StoreKey.castManualDevices) ?? '').split(',').where((h) => h.isNotEmpty).toList();
+
+  /// Looks for a renderer at [host] (IP address, hostname or description URL) and remembers it if found
+  Future<List<(String, CastDestinationType, dynamic)>> addManualDevice(String host) async {
+    final trimmed = host.trim();
+    if (trimmed.isEmpty) {
+      return const [];
+    }
+
+    final devices = await _dlnaRepository.listDestinations(extraHosts: [trimmed], timeout: const Duration(seconds: 2));
+    final targetHost = Uri.tryParse(trimmed)?.host;
+    final matching = devices
+        .where((d) => d.location.host == trimmed || d.location.toString() == trimmed || d.location.host == targetHost)
+        .toList();
+
+    if (matching.isNotEmpty) {
+      final hosts = {...manualHosts, trimmed};
+      await Store.put(StoreKey.castManualDevices, hosts.join(','));
+    }
+    return matching.map(_toDestination).toList(growable: false);
+  }
+
+  /// The API endpoint the TV should download media from.
+  ///
+  /// The TV can't use the phone's VPN (e.g. Tailscale), so prefer the local network URL
+  /// configured in the networking settings, if any.
+  static String castEndpoint() {
+    final serverEndpoint = Store.get(StoreKey.serverEndpoint);
+    final localEndpoint = SettingsRepository.instance.appConfig.network.localEndpoint?.trim();
+    if (localEndpoint == null || localEndpoint.isEmpty) {
+      return serverEndpoint;
+    }
+    final normalized = normalizeServerUrl(localEndpoint);
+    return normalized.endsWith('/api') ? normalized : '$normalized/api';
+  }
+
+  /// Whether the server URL the TV would use is only reachable through a VPN like Tailscale
+  static bool isCastEndpointVpnOnly() {
+    final host = Uri.tryParse(castEndpoint())?.host.toLowerCase() ?? '';
+    if (host.endsWith('.ts.net') || host.endsWith('.tailscale.net')) {
+      return true;
+    }
+    final parts = host.split('.').map(int.tryParse).toList();
+    return parts.length == 4 && parts[0] == 100 && parts[1] != null && parts[1]! >= 64 && parts[1]! < 128;
   }
 
   Future<void> connect(DlnaDevice device) async {
@@ -93,8 +139,7 @@ class DlnaService {
     if (expiresAt == null) {
       return false;
     }
-    final bufferedExpiration = DateTime.parse(expiresAt)
-        .subtract(const Duration(minutes: 1));
+    final bufferedExpiration = DateTime.parse(expiresAt).subtract(const Duration(minutes: 1));
     return bufferedExpiration.isAfter(DateTime.now());
   }
 
@@ -127,7 +172,12 @@ class DlnaService {
       final unauthenticatedUrl = asset.isVideo
           ? getPlaybackUrlForRemoteId(asset.id)
           : getThumbnailUrlForRemoteId(asset.id, type: AssetMediaSize.fullsize);
-      final url = "$unauthenticatedUrl&sessionKey=${_sessionKey?.token}";
+      final serverEndpoint = Store.get(StoreKey.serverEndpoint);
+      final endpoint = castEndpoint();
+      final url = "${endpoint + unauthenticatedUrl.substring(serverEndpoint.length)}&sessionKey=${_sessionKey?.token}";
+      if (isCastEndpointVpnOnly()) {
+        _log.warning('The TV probably can not reach $endpoint: set a local network URL in the networking settings');
+      }
 
       final mimeType = await _resolveMimeType(asset, url);
       if (generation != _loadGeneration || _device != device) {
@@ -157,11 +207,7 @@ class DlnaService {
       await _dlnaRepository.sendAction(device, 'Play', {'Speed': '1'});
       _startPolling();
     } catch (error, stackTrace) {
-      _log.warning(
-        'Failed to cast asset ${asset.id} via DLNA',
-        error,
-        stackTrace,
-      );
+      _log.warning('Failed to cast asset ${asset.id} via DLNA', error, stackTrace);
       if (generation == _loadGeneration) {
         currentAssetId = null;
         onCastState?.call(CastState.idle);
@@ -171,8 +217,7 @@ class DlnaService {
 
   Future<String> _resolveMimeType(RemoteAsset asset, String url) async {
     final fromServer = await _dlnaRepository.getContentType(url);
-    if (fromServer != null &&
-        (fromServer.startsWith('image/') || fromServer.startsWith('video/'))) {
+    if (fromServer != null && (fromServer.startsWith('image/') || fromServer.startsWith('video/'))) {
       return fromServer;
     }
 
@@ -185,9 +230,7 @@ class DlnaService {
   }
 
   String _buildDidlMetadata(RemoteAsset asset, String url, String mimeType) {
-    final upnpClass = asset.isVideo
-        ? 'object.item.videoItem'
-        : 'object.item.imageItem.photo';
+    final upnpClass = asset.isVideo ? 'object.item.videoItem' : 'object.item.imageItem.photo';
     final dlnaFeatures = asset.isVideo
         ? 'DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000'
         : (mimeType == 'image/jpeg'
@@ -212,10 +255,7 @@ class DlnaService {
 
   void _startPolling() {
     _stopPolling();
-    _pollingTimer = Timer.periodic(
-      const Duration(seconds: 1),
-      (_) => unawaited(_poll()),
-    );
+    _pollingTimer = Timer.periodic(const Duration(seconds: 1), (_) => unawaited(_poll()));
     unawaited(_poll());
   }
 
@@ -236,10 +276,7 @@ class DlnaService {
     _polling = true;
 
     try {
-      final transport = await _dlnaRepository.sendAction(
-        device,
-        'GetTransportInfo',
-      );
+      final transport = await _dlnaRepository.sendAction(device, 'GetTransportInfo');
       final castState = switch (transport['CurrentTransportState']) {
         'PLAYING' => CastState.playing,
         'PAUSED_PLAYBACK' || 'PAUSED_RECORDING' => CastState.paused,
@@ -249,10 +286,7 @@ class DlnaService {
       onCastState?.call(castState);
 
       if (_isVideo) {
-        final position = await _dlnaRepository.sendAction(
-          device,
-          'GetPositionInfo',
-        );
+        final position = await _dlnaRepository.sendAction(device, 'GetPositionInfo');
         final duration = _parseTime(position['TrackDuration']);
         final relTime = _parseTime(position['RelTime']);
         if (duration != null && duration > Duration.zero) {
@@ -272,10 +306,7 @@ class DlnaService {
     }
   }
 
-  Future<void> _send(
-    String action, [
-    Map<String, String> arguments = const {},
-  ]) async {
+  Future<void> _send(String action, [Map<String, String> arguments = const {}]) async {
     final device = _device;
     if (device == null) {
       return;
@@ -296,9 +327,7 @@ class DlnaService {
   }
 
   void seekTo(Duration position) {
-    unawaited(
-      _send('Seek', {'Unit': 'REL_TIME', 'Target': _formatTime(position)}),
-    );
+    unawaited(_send('Seek', {'Unit': 'REL_TIME', 'Target': _formatTime(position)}));
   }
 
   void stop() {
@@ -330,10 +359,6 @@ class DlnaService {
     if (hours == null || minutes == null || seconds == null) {
       return null;
     }
-    return Duration(
-      hours: hours,
-      minutes: minutes,
-      milliseconds: (seconds * 1000).round(),
-    );
+    return Duration(hours: hours, minutes: minutes, milliseconds: (seconds * 1000).round());
   }
 }
