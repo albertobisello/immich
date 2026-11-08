@@ -168,9 +168,19 @@ jobs:
           ANDROID_STORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
           VERSION_NAME: ${{ steps.version.outputs.name }}
           VERSION_CODE: ${{ steps.version.outputs.code }}
+        # Solo arm64-v8a (il telefono di destinazione è arm64, Android 17): Flutter compila
+        # Dart e la libreria Rust (hook di native_core) solo per aarch64-linux-android, invece
+        # di impacchettare anche armeabi-v7a e x86_64. --split-debug-info toglie dall'APK i
+        # simboli Dart, salvati a parte come artifact per decodificare eventuali stack trace.
         run: |
-          mise exec -- flutter build apk --release --build-name "$VERSION_NAME" --build-number "$VERSION_CODE"
+          mise exec -- flutter build apk --release \
+            --target-platform android-arm64 \
+            --split-debug-info=build/debug-info \
+            --build-name "$VERSION_NAME" --build-number "$VERSION_CODE"
           ls -la build/app/outputs/flutter-apk/
+          APK=build/app/outputs/flutter-apk/app-release.apk
+          echo "### APK: $(du -h "$APK" | cut -f1)" >> "$GITHUB_STEP_SUMMARY"
+          { echo '```'; unzip -l "$APK" 'lib/*'; echo '```'; } | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: 🚀 Carica su Firebase App Distribution
         uses: wzieba/Firebase-Distribution-Github-Action@bd494989dd4bec0343f78adee87fe66e48279ad6 # v1.7.1
@@ -187,6 +197,14 @@ jobs:
         with:
           name: immich-plus-${{ steps.version.outputs.name }}
           path: mobile/build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: ignore
+
+      - name: 🐞 Salva i simboli di debug Dart
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: immich-plus-${{ steps.version.outputs.name }}-debug-info
+          path: mobile/build/debug-info
           if-no-files-found: ignore
 
       - name: 🧽 Rimuovi il keystore
