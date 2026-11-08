@@ -83,6 +83,25 @@ android {
     }
   }
   namespace 'app.alextran.immich'
+
+  // Immich Plus: APK più leggero, attivato solo dalle variabili d'ambiente del workflow Firebase.
+  // ANDROID_ABI_ONLY=arm64-v8a scarta le librerie native delle altre ABI che arrivano dalle
+  // dipendenze AAR (Cronet, MapLibre, ...), che --target-platform di Flutter non filtra.
+  // ANDROID_COMPRESS_NATIVE_LIBS=true comprime le .so nell'APK (vengono estratte all'installazione).
+  def abiOnly = System.getenv("ANDROID_ABI_ONLY")
+  def compressNativeLibs = System.getenv("ANDROID_COMPRESS_NATIVE_LIBS") == "true"
+  packaging {
+    jniLibs {
+      if (abiOnly) {
+        ['armeabi-v7a', 'arm64-v8a', 'x86', 'x86_64'].findAll { it != abiOnly }.each {
+          excludes.add("**/${it}/*.so".toString())
+        }
+      }
+      if (compressNativeLibs) {
+        useLegacyPackaging = true
+      }
+    }
+  }
 }
 
 flutter {
