@@ -168,9 +168,13 @@ jobs:
           ANDROID_STORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
           VERSION_NAME: ${{ steps.version.outputs.name }}
           VERSION_CODE: ${{ steps.version.outputs.code }}
+          ANDROID_ABI_ONLY: arm64-v8a
+          ANDROID_COMPRESS_NATIVE_LIBS: 'true'
         # Solo arm64-v8a (il telefono di destinazione è arm64, Android 17): Flutter compila
         # Dart e la libreria Rust (hook di native_core) solo per aarch64-linux-android, invece
-        # di impacchettare anche armeabi-v7a e x86_64. --split-debug-info toglie dall'APK i
+        # di impacchettare anche armeabi-v7a e x86_64; ANDROID_ABI_ONLY (build.gradle) scarta anche
+        # le .so delle altre ABI portate dalle dipendenze (Cronet, MapLibre) e
+        # ANDROID_COMPRESS_NATIVE_LIBS le comprime nell'APK. --split-debug-info toglie dall'APK i
         # simboli Dart, salvati a parte come artifact per decodificare eventuali stack trace.
         run: |
           mise exec -- flutter build apk --release \
