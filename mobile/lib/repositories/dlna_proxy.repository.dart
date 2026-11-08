@@ -1,14 +1,14 @@
 import 'dart:async';
 import 'dart:io';
 import 'dart:math';
+import 'dart:typed_data';
 
 import 'package:hooks_riverpod/hooks_riverpod.dart';
-import 'package:http/http.dart' as http;
-import 'package:immich_mobile/infrastructure/repositories/network.repository.dart';
+import 'package:immich_mobile/infrastructure/repositories/settings.repository.dart';
 import 'package:logging/logging.dart';
 
 final dlnaProxyRepositoryProvider = Provider((ref) {
-  final proxy = DlnaProxyRepository(() => NetworkRepository.client);
+  final proxy = DlnaProxyRepository(() => SettingsRepository.instance.appConfig.network.customHeaders);
   ref.onDispose(() => unawaited(proxy.stop()));
   return proxy;
 });
@@ -29,7 +29,15 @@ class _ProxyEntry {
 /// which many renderers (LG included) don't follow. The phone fetches the media the same way
 /// the app does and serves it on the local network with the headers DLNA renderers expect.
 class DlnaProxyRepository {
-  final http.Client Function() _clientFactory;
+  /// Extra headers configured in the networking settings (e.g. for a reverse proxy)
+  final Map<String, String> Function() _extraHeaders;
+
+  /// Plain dart:io client: the media URLs carry a session key, and the VPN (if any) is system wide.
+  /// The app's native client isn't used here, as streaming large videos through it from a
+  /// background relay was a crash risk.
+  final HttpClient _client = HttpClient()
+    ..connectionTimeout = const Duration(seconds: 15)
+    ..idleTimeout = const Duration(seconds: 15);
   final _log = Logger('DlnaProxyRepository');
   final _random = Random.secure();
 
@@ -37,7 +45,7 @@ class DlnaProxyRepository {
   final _entries = <String, _ProxyEntry>{};
   final _order = <String>[];
 
-  DlnaProxyRepository(this._clientFactory);
+  DlnaProxyRepository(this._extraHeaders);
 
   /// Makes [upstream] available to the renderer at [rendererHost] and returns the URL to give it
   Future<String> publish({
@@ -68,20 +76,30 @@ class DlnaProxyRepository {
   /// Returns the content type the server answers with for [url], following redirects
   Future<String?> probeContentType(Uri url) async {
     try {
-      final request = http.Request('HEAD', url)
-        ..followRedirects = true
-        ..maxRedirects = 5;
-      final response = await _clientFactory().send(request).timeout(const Duration(seconds: 10));
-      await response.stream.drain<void>();
+      final response = await _open('HEAD', url).timeout(const Duration(seconds: 15));
+      await response.drain<void>();
       if (response.statusCode >= 400) {
         _log.warning('HEAD ${url.path} answered ${response.statusCode}');
         return null;
       }
-      return response.headers['content-type']?.split(';').first.trim().toLowerCase();
+      return response.headers.contentType?.mimeType.toLowerCase();
     } catch (error) {
       _log.warning('Failed to probe ${url.path}', error);
       return null;
     }
+  }
+
+  Future<HttpClientResponse> _open(String method, Uri url, {String? range}) async {
+    final request = await _client.openUrl(method, url);
+    request.followRedirects = true;
+    request.maxRedirects = 5;
+    // get the bytes exactly as stored, so Content-Length stays valid
+    request.headers.removeAll(HttpHeaders.acceptEncodingHeader);
+    _extraHeaders().forEach(request.headers.set);
+    if (range != null) {
+      request.headers.set(HttpHeaders.rangeHeader, range);
+    }
+    return request.close();
   }
 
   Future<void> stop() async {
@@ -89,13 +107,20 @@ class DlnaProxyRepository {
     _server = null;
     _entries.clear();
     _order.clear();
-    await server?.close(force: true);
+    try {
+      await server?.close(force: true);
+    } catch (error) {
+      _log.fine('Failed to close DLNA proxy', error);
+    }
   }
 
   Future<HttpServer> _start() async {
     final server = await HttpServer.bind(InternetAddress.anyIPv4, 0);
     server.autoCompress = false;
-    server.listen((request) => unawaited(_handle(request)));
+    server.listen(
+      (request) => unawaited(_handle(request)),
+      onError: (Object error, StackTrace stackTrace) => _log.warning('DLNA proxy server error', error, stackTrace),
+    );
     _log.info('DLNA proxy listening on port ${server.port}');
     return server;
   }
@@ -114,18 +139,16 @@ class DlnaProxyRepository {
       final range = request.headers.value(HttpHeaders.rangeHeader);
       _log.fine('${request.method} from ${request.connectionInfo?.remoteAddress.address} range=$range');
 
-      final upstreamRequest = http.Request(entry.isVideo ? request.method : 'GET', entry.upstream)
-        ..followRedirects = true
-        ..maxRedirects = 5;
-      if (range != null && entry.isVideo) {
-        upstreamRequest.headers[HttpHeaders.rangeHeader] = range;
-      }
-      final upstream = await _clientFactory().send(upstreamRequest);
+      final upstream = await _open(
+        entry.isVideo ? request.method : 'GET',
+        entry.upstream,
+        range: entry.isVideo ? range : null,
+      );
 
       if (upstream.statusCode >= 400) {
         _log.warning('Upstream ${entry.upstream.path} answered ${upstream.statusCode}');
         response.statusCode = upstream.statusCode;
-        await upstream.stream.drain<void>();
+        await upstream.drain<void>();
         await response.close();
         return;
       }
@@ -136,7 +159,9 @@ class DlnaProxyRepository {
 
       if (!entry.isVideo) {
         // TVs want a Content-Length for photos, so buffer them (a few MB at most)
-        final bytes = await upstream.stream.toBytes();
+        final bytes = await upstream
+            .fold<BytesBuilder>(BytesBuilder(copy: false), (b, d) => b..add(d))
+            .then((b) => b.takeBytes());
         response.statusCode = HttpStatus.ok;
         response.contentLength = bytes.length;
         if (request.method == 'GET') {
@@ -148,19 +173,19 @@ class DlnaProxyRepository {
 
       response.statusCode = upstream.statusCode;
       response.headers.set(HttpHeaders.acceptRangesHeader, 'bytes');
-      final contentRange = upstream.headers[HttpHeaders.contentRangeHeader];
+      final contentRange = upstream.headers.value(HttpHeaders.contentRangeHeader);
       if (contentRange != null) {
         response.headers.set(HttpHeaders.contentRangeHeader, contentRange);
       }
       final contentLength = upstream.contentLength;
-      if (contentLength != null && contentLength >= 0) {
+      if (contentLength >= 0) {
         response.contentLength = contentLength;
       }
 
       if (request.method == 'HEAD') {
-        await upstream.stream.drain<void>();
+        await upstream.drain<void>();
       } else {
-        await response.addStream(upstream.stream);
+        await response.addStream(upstream);
       }
       await response.close();
     } catch (error, stackTrace) {
