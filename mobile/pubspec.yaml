@@ -38,6 +38,7 @@ dependencies:
   home_widget: ^0.9.3
   hooks_riverpod: ^2.6.1
   http: ^1.6.0
+  image: ^4.9.1
   image_picker: ^1.2.3
   native_core:
     path: ../native/native_core

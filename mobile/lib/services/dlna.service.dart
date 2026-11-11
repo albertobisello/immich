@@ -1,4 +1,6 @@
 import 'dart:async';
+import 'dart:typed_data';
+import 'dart:ui' show Rect;
 
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:immich_mobile/domain/models/asset/base_asset.model.dart';
@@ -10,6 +12,7 @@ import 'package:immich_mobile/repositories/asset_api.repository.dart';
 import 'package:immich_mobile/repositories/dlna.repository.dart';
 import 'package:immich_mobile/repositories/dlna_proxy.repository.dart';
 import 'package:immich_mobile/repositories/sessions_api.repository.dart';
+import 'package:immich_mobile/utils/cast_crop.dart';
 import 'package:immich_mobile/utils/image_url_builder.dart';
 import 'package:logging/logging.dart';
 // ignore: import_rule_openapi, we are only using the AssetMediaSize enum
@@ -43,6 +46,14 @@ class DlnaService {
   Timer? _pollingTimer;
   bool _polling = false;
   int _loadGeneration = 0;
+
+  // Zoom mirroring for photos
+  RemoteAsset? _currentAsset;
+  ({String url, String metadata})? _fullImage;
+  String? _sourceUrl;
+  ({String assetId, Uint8List bytes})? _sourceCache;
+  int _cropGeneration = 0;
+  bool _showingCrop = false;
 
   void Function(bool)? onConnectionState;
   void Function(Duration)? onCurrentTime;
@@ -99,6 +110,8 @@ class DlnaService {
     _stopPolling();
     _device = null;
     currentAssetId = null;
+    _currentAsset = null;
+    _sourceCache = null;
     onReceiverName?.call("");
     onConnectionState?.call(false);
 
@@ -130,7 +143,12 @@ class DlnaService {
     }
 
     final generation = ++_loadGeneration;
+    _cropGeneration++;
     currentAssetId = asset.id;
+    _currentAsset = asset;
+    _fullImage = null;
+    _sourceUrl = null;
+    _showingCrop = false;
     _isVideo = asset.isVideo;
     _stopPolling();
     onCastState?.call(CastState.buffering);
@@ -162,20 +180,12 @@ class DlnaService {
       );
       _log.info('Casting ${asset.id} (${media.mimeType}) to ${device.name} via $url');
       final metadata = _buildDidlMetadata(asset, url, media.mimeType, dlnaFeatures);
-
-      try {
-        await _dlnaRepository.sendAction(device, 'SetAVTransportURI', {
-          'CurrentURI': url,
-          'CurrentURIMetaData': metadata,
-        });
-      } on DlnaSoapException {
-        // Some renderers (LG included) refuse a new URI while playing, stop and retry
-        await _dlnaRepository.sendAction(device, 'Stop');
-        await _dlnaRepository.sendAction(device, 'SetAVTransportURI', {
-          'CurrentURI': url,
-          'CurrentURIMetaData': metadata,
-        });
+      if (!asset.isVideo) {
+        _fullImage = (url: url, metadata: metadata);
+        _sourceUrl = media.url;
       }
+
+      await _setUri(device, url, metadata);
 
       if (generation != _loadGeneration) {
         return;
@@ -189,6 +199,83 @@ class DlnaService {
         currentAssetId = null;
         onCastState?.call(CastState.idle);
       }
+    }
+  }
+
+  Future<void> _setUri(DlnaDevice device, String url, String metadata) async {
+    try {
+      await _dlnaRepository.sendAction(device, 'SetAVTransportURI', {
+        'CurrentURI': url,
+        'CurrentURIMetaData': metadata,
+      });
+    } on DlnaSoapException {
+      // Some renderers (LG included) refuse a new URI while playing, stop and retry
+      await _dlnaRepository.sendAction(device, 'Stop');
+      await _dlnaRepository.sendAction(device, 'SetAVTransportURI', {
+        'CurrentURI': url,
+        'CurrentURIMetaData': metadata,
+      });
+    }
+  }
+
+  /// Mirrors the phone's zoom on the TV: DLNA renderers can't zoom, so the visible part of the
+  /// photo is cropped on the phone and sent as a new image. A null [crop] restores the whole photo.
+  Future<void> showCrop(String assetId, Rect? crop) async {
+    final device = _device;
+    final asset = _currentAsset;
+    final fullImage = _fullImage;
+    final sourceUrl = _sourceUrl;
+    if (device == null || asset == null || asset.id != assetId || fullImage == null || sourceUrl == null) {
+      return;
+    }
+
+    final generation = ++_cropGeneration;
+    final loadGeneration = _loadGeneration;
+    bool stale() => generation != _cropGeneration || loadGeneration != _loadGeneration || _device != device;
+
+    try {
+      if (crop == null) {
+        if (_showingCrop) {
+          _showingCrop = false;
+          await _setUri(device, fullImage.url, fullImage.metadata);
+          if (!stale()) {
+            await _dlnaRepository.sendAction(device, 'Play', {'Speed': '1'});
+          }
+        }
+        return;
+      }
+
+      final cached = _sourceCache;
+      final Uint8List source;
+      if (cached != null && cached.assetId == asset.id) {
+        source = cached.bytes;
+      } else {
+        source = await _dlnaProxyRepository.fetchBytes(Uri.parse(sourceUrl));
+        _sourceCache = (assetId: asset.id, bytes: source);
+      }
+      if (stale()) {
+        return;
+      }
+
+      final jpeg = await renderCastCrop(source, crop);
+      if (stale()) {
+        return;
+      }
+
+      final url = await _dlnaProxyRepository.publishBytes(
+        bytes: jpeg,
+        mimeType: 'image/jpeg',
+        dlnaFeatures: _imageFeatures,
+        rendererHost: device.location.host,
+      );
+      _log.fine('Showing crop $crop of ${asset.id} on ${device.name} (${jpeg.length} bytes)');
+      _showingCrop = true;
+      await _setUri(device, url, _buildDidlMetadata(asset, url, 'image/jpeg', _imageFeatures));
+      if (!stale()) {
+        await _dlnaRepository.sendAction(device, 'Play', {'Speed': '1'});
+      }
+    } catch (error, stackTrace) {
+      _log.warning('Failed to show zoomed photo on the TV', error, stackTrace);
     }
   }
 
@@ -324,6 +411,7 @@ class DlnaService {
     _loadGeneration++;
     _stopPolling();
     currentAssetId = null;
+    _currentAsset = null;
     unawaited(_send('Stop'));
   }
 

@@ -14,6 +14,7 @@ import 'package:immich_mobile/extensions/scroll_extensions.dart';
 import 'package:immich_mobile/presentation/widgets/asset_viewer/asset_details.widget.dart';
 import 'package:immich_mobile/presentation/widgets/asset_viewer/asset_stack.provider.dart';
 import 'package:immich_mobile/presentation/widgets/asset_viewer/asset_stack.widget.dart';
+import 'package:immich_mobile/presentation/widgets/asset_viewer/cast_zoom_sync.widget.dart';
 import 'package:immich_mobile/presentation/widgets/asset_viewer/ocr_overlay.widget.dart';
 import 'package:immich_mobile/presentation/widgets/asset_viewer/video_viewer.widget.dart';
 import 'package:immich_mobile/presentation/widgets/images/image_provider.dart';
@@ -21,6 +22,7 @@ import 'package:immich_mobile/presentation/widgets/images/progressive_image.widg
 import 'package:immich_mobile/presentation/widgets/images/thumbnail.widget.dart';
 import 'package:immich_mobile/providers/asset_viewer/asset_viewer.provider.dart';
 import 'package:immich_mobile/providers/asset_viewer/is_motion_video_playing.provider.dart';
+import 'package:immich_mobile/providers/cast.provider.dart';
 import 'package:immich_mobile/providers/infrastructure/settings.provider.dart';
 import 'package:immich_mobile/providers/infrastructure/timeline.provider.dart';
 import 'package:immich_mobile/providers/view_intent/view_intent_file_path.provider.dart';
@@ -444,6 +446,7 @@ class _AssetPageState extends ConsumerState<AssetPage> {
         : liveMotionPlaying;
     final timelineOrigin = ref.watch(timelineServiceProvider).origin;
     final showingOcr = ref.watch(assetViewerProvider.select((s) => s.showingOcr));
+    final isCasting = ref.watch(castProvider.select((s) => s.isCasting));
 
     final asset = _asset;
     if (asset == null) {
@@ -498,6 +501,17 @@ class _AssetPageState extends ConsumerState<AssetPage> {
                     remoteThumbnailSize: thumbnailSize,
                   ),
                 ),
+                if (isCasting &&
+                    isCurrent &&
+                    displayAsset is RemoteAsset &&
+                    displayAsset.isImage &&
+                    !isPlayingMotionVideo &&
+                    ref.read(castProvider.notifier).mirrorsZoom)
+                  CastZoomSync(
+                    assetId: displayAsset.id,
+                    controller: _viewController,
+                    viewportSize: Size(viewportWidth, viewportHeight),
+                  ),
                 if (showingOcr && displayAsset.width != null && displayAsset.height != null)
                   Positioned.fill(
                     child: OcrOverlay(
