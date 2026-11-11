@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:ui' show Rect;
 
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:immich_mobile/domain/models/asset/base_asset.model.dart';
@@ -118,6 +119,16 @@ class CastNotifier extends StateNotifier<CastManagerState> {
     final names = discovered.map((d) => d.$1).toSet();
     discovered = [...discovered, ...found.where((d) => !names.contains(d.$1))];
     return true;
+  }
+
+  /// Whether the current receiver needs the phone's zoom to be mirrored (DLNA TVs can't zoom)
+  bool get mirrorsZoom => state.isCasting && _activeType == CastDestinationType.dlna;
+
+  /// Shows the part [crop] (normalized coordinates) of the photo [assetId] on the TV, or the whole photo if null
+  void setZoom(String assetId, Rect? crop) {
+    if (mirrorsZoom) {
+      unawaited(_dlnaService.showCrop(assetId, crop));
+    }
   }
 
   void toggle() {

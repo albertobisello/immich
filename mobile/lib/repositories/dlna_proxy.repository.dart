@@ -14,12 +14,13 @@ final dlnaProxyRepositoryProvider = Provider((ref) {
 });
 
 class _ProxyEntry {
-  final Uri upstream;
+  final Uri? upstream;
+  final Uint8List? bytes;
   final String mimeType;
   final String dlnaFeatures;
   final bool isVideo;
 
-  const _ProxyEntry(this.upstream, this.mimeType, this.dlnaFeatures, this.isVideo);
+  const _ProxyEntry(this.upstream, this.mimeType, this.dlnaFeatures, this.isVideo, {this.bytes});
 }
 
 /// A tiny HTTP server on the phone that relays media from the Immich server to a DLNA TV.
@@ -55,6 +56,33 @@ class DlnaProxyRepository {
     required bool isVideo,
     required String rendererHost,
   }) async {
+    return _register(_ProxyEntry(upstream, mimeType, dlnaFeatures, isVideo), rendererHost);
+  }
+
+  /// Serves [bytes] (e.g. a zoomed crop rendered on the phone) to the renderer at [rendererHost]
+  Future<String> publishBytes({
+    required Uint8List bytes,
+    required String mimeType,
+    required String dlnaFeatures,
+    required String rendererHost,
+  }) {
+    return _register(_ProxyEntry(null, mimeType, dlnaFeatures, false, bytes: bytes), rendererHost);
+  }
+
+  /// Downloads [url] fully, following redirects
+  Future<Uint8List> fetchBytes(Uri url) async {
+    final response = await _open('GET', url).timeout(const Duration(seconds: 30));
+    if (response.statusCode >= 400) {
+      await response.drain<void>();
+      throw HttpException('GET ${url.path} answered ${response.statusCode}', uri: url);
+    }
+    return _readAll(response);
+  }
+
+  static Future<Uint8List> _readAll(Stream<List<int>> stream) =>
+      stream.fold<BytesBuilder>(BytesBuilder(copy: false), (b, d) => b..add(d)).then((b) => b.takeBytes());
+
+  Future<String> _register(_ProxyEntry entry, String rendererHost) async {
     final server = _server ??= await _start();
     final address = await _localAddressFor(rendererHost);
     if (address == null) {
@@ -62,14 +90,14 @@ class DlnaProxyRepository {
     }
 
     final token = List.generate(16, (_) => _random.nextInt(16).toRadixString(16)).join();
-    _entries[token] = _ProxyEntry(upstream, mimeType, dlnaFeatures, isVideo);
+    _entries[token] = entry;
     _order.add(token);
     // keep a few entries around: TVs re-request media while it's on screen
     while (_order.length > 4) {
       _entries.remove(_order.removeAt(0));
     }
 
-    final extension = _extensionFor(mimeType);
+    final extension = _extensionFor(entry.mimeType);
     return 'http://${address.address}:${server.port}/$token/media$extension';
   }
 
@@ -87,6 +115,12 @@ class DlnaProxyRepository {
       _log.warning('Failed to probe ${url.path}', error);
       return null;
     }
+  }
+
+  static void _setDlnaHeaders(HttpResponse response, _ProxyEntry entry) {
+    response.headers.contentType = ContentType.parse(entry.mimeType);
+    response.headers.set('transferMode.dlna.org', entry.isVideo ? 'Streaming' : 'Interactive');
+    response.headers.set('contentFeatures.dlna.org', entry.dlnaFeatures);
   }
 
   Future<HttpClientResponse> _open(String method, Uri url, {String? range}) async {
@@ -136,32 +170,40 @@ class DlnaProxyRepository {
         return;
       }
 
+      final bytes = entry.bytes;
+      if (bytes != null) {
+        _setDlnaHeaders(response, entry);
+        response.statusCode = HttpStatus.ok;
+        response.contentLength = bytes.length;
+        if (request.method == 'GET') {
+          response.add(bytes);
+        }
+        await response.close();
+        return;
+      }
+
       final range = request.headers.value(HttpHeaders.rangeHeader);
       _log.fine('${request.method} from ${request.connectionInfo?.remoteAddress.address} range=$range');
 
       final upstream = await _open(
         entry.isVideo ? request.method : 'GET',
-        entry.upstream,
+        entry.upstream!,
         range: entry.isVideo ? range : null,
       );
 
       if (upstream.statusCode >= 400) {
-        _log.warning('Upstream ${entry.upstream.path} answered ${upstream.statusCode}');
+        _log.warning('Upstream ${entry.upstream!.path} answered ${upstream.statusCode}');
         response.statusCode = upstream.statusCode;
         await upstream.drain<void>();
         await response.close();
         return;
       }
 
-      response.headers.contentType = ContentType.parse(entry.mimeType);
-      response.headers.set('transferMode.dlna.org', entry.isVideo ? 'Streaming' : 'Interactive');
-      response.headers.set('contentFeatures.dlna.org', entry.dlnaFeatures);
+      _setDlnaHeaders(response, entry);
 
       if (!entry.isVideo) {
         // TVs want a Content-Length for photos, so buffer them (a few MB at most)
-        final bytes = await upstream
-            .fold<BytesBuilder>(BytesBuilder(copy: false), (b, d) => b..add(d))
-            .then((b) => b.takeBytes());
+        final bytes = await _readAll(upstream);
         response.statusCode = HttpStatus.ok;
         response.contentLength = bytes.length;
         if (request.method == 'GET') {
